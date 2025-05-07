@@ -20,7 +20,7 @@ csv_file = 'plates_log.csv'
 if not os.path.exists(csv_file):
     with open(csv_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Plate Number', 'Payment Status', 'Timestamp'])
+        writer.writerow(['Plate Number', 'Payment Status', 'Timestamp', 'amount'])
 
 # ===== Auto-detect Arduino Serial Port =====
 def detect_arduino_port():
@@ -32,7 +32,7 @@ def detect_arduino_port():
 
 arduino_port = detect_arduino_port()
 if arduino_port:
-    arduino_port = "COM5"
+    arduino_port = "COM11"
     print(f"[CONNECTED] Arduino on {arduino_port}")
     arduino = serial.Serial(arduino_port, 9600, timeout=1)
     print(f"[CONNECTED] Arduino on {arduino_port}")
@@ -44,6 +44,10 @@ else:
 # ===== Ultrasonic Sensor Setup =====
 import random
 def mock_ultrasonic_distance():
+    # raw = arduino.readline()
+    # distance = raw.decode('utf-8').strip()
+    # print(f"{distance} cm")
+    # return float(distance)
     return random.choice([random.randint(10, 40)] + [random.randint(60, 150)] * 10)
 
 # Initialize webcam
@@ -67,6 +71,10 @@ while True:
         results = model(frame)
 
         for result in results:
+            # if result.boxes is None or len(result.boxes) == 0:
+            #                 print("[INFO] No detections, trying again...")
+            #                 time.sleep(0.3)
+            #                 continue
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 plate_img = frame[y1:y2, x1:x2]
@@ -103,7 +111,7 @@ while True:
 
                                     with open(csv_file, 'a', newline='') as f:
                                         writer = csv.writer(f)
-                                        writer.writerow([most_common, 0,time.strftime('%Y-%m-%d %H:%M:%S')])
+                                        writer.writerow([most_common, 0,time.strftime('%Y-%m-%d %H:%M:%S'), 0])
                                     print(f"[SAVED] {most_common} logged to CSV.")
 
                                     if arduino:
