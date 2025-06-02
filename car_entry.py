@@ -42,13 +42,17 @@ else:
     arduino = None
 
 # ===== Ultrasonic Sensor Setup =====
-import random
+# import random
 def mock_ultrasonic_distance():
-    # raw = arduino.readline()
-    # distance = raw.decode('utf-8').strip()
-    # print(f"{distance} cm")
-    # return float(distance)
-    return random.choice([random.randint(10, 40)] + [random.randint(60, 150)] * 10)
+    raw = arduino.readline()
+    try:
+        distance = float(raw.decode('utf-8').strip())
+        print(f"{distance} cm")
+        return distance
+    except ValueError:
+        print("Received invalid data from serial:", raw)
+        return 100
+    # return random.choice([random.randint(10, 40)])
 
 # Initialize webcam
 cap = cv2.VideoCapture(0)
