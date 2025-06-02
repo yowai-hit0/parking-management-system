@@ -9,7 +9,7 @@ import csv
 from collections import Counter
 
 # Load YOLOv8 model
-model = YOLO('C:/Users/PC/Desktop/ne-sample/embedded/parking-management-system/best.pt')
+model = YOLO('best.pt')
 
 # Plate save directory
 save_dir = 'plates'
@@ -32,7 +32,7 @@ def detect_arduino_port():
 
 arduino_port = detect_arduino_port()
 if arduino_port:
-    arduino_port = "COM11"
+    arduino_port = "COM7"
     print(f"[CONNECTED] Arduino on {arduino_port}")
     arduino = serial.Serial(arduino_port, 9600, timeout=1)
     print(f"[CONNECTED] Arduino on {arduino_port}")
@@ -48,7 +48,7 @@ def mock_ultrasonic_distance():
     # distance = raw.decode('utf-8').strip()
     # print(f"{distance} cm")
     # return float(distance)
-    return random.choice([random.randint(10, 40)] + [random.randint(60, 150)] * 10)
+    return random.choice([random.randint(10, 40)])
 
 # Initialize webcam
 cap = cv2.VideoCapture(0)
