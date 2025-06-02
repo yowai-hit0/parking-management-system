@@ -1,184 +1,214 @@
 import serial
 import time
-import csv
+import psycopg2
+import re
 from datetime import datetime
 
 # === CONFIG ===
-
-SERIAL_PORT = 'COM12'  # Change to your port
+SERIAL_PORT = 'COM8'  # Change this to your actual serial port
 BAUD_RATE = 9600
-CSV_FILE = 'plates_log.csv'
 RATE_PER_HOUR = 200
 
 
-def find_latest_unpaid(plate):
-    with open(CSV_FILE, 'r', newline='') as f:
-        reader = csv.DictReader(f)
-        entries = [row for row in reader if
-                   row['Plate Number'].strip() == plate.strip() and row['Payment Status'] == '0']
-        if not entries:
-            return None
-        latest = max(entries, key=lambda x: datetime.strptime(x['Timestamp'], "%Y-%m-%d %H:%M:%S"))
-        return latest
+# PostgreSQL connection setup
+def setup_postgres():
+    try:
+        conn = psycopg2.connect(
+            dbname="parking_db",
+            user="postgres",
+            password="gomgom1029",
+            host="localhost"
+        )
+        return conn
+    except Exception as e:
+        print(f"[POSTGRES ERROR] Connection failed: {e}")
+        return None
 
 
-def mark_as_paid(target_row):
-    rows = []
-    with open(CSV_FILE, 'r', newline='') as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
+# Find the latest unpaid session for a plate
+def find_latest_unpaid(plate, conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, entry_time
+            FROM plates_log
+            WHERE plate_number = %s
+              AND payment_status = 0
+              AND exit_time IS NULL
+            ORDER BY entry_time DESC
+            LIMIT 1
+        """, (plate,))
+        return cur.fetchone()
+    except Exception as e:
+        print(f"[POSTGRES ERROR] Query failed: {e}")
+        return None
 
-    for row in rows:
-        if (row['Plate Number'] == target_row['Plate Number'] and
-                row['Timestamp'] == target_row['Timestamp'] and
-                row['Payment Status'] == '0'):
-            row['Payment Status'] = '1'
-            break
 
-    with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Plate Number', 'Payment Status', 'Timestamp'])
-        writer.writeheader()
-        writer.writerows(rows)
+# Mark a record as paid
+def mark_as_paid(record_id, amount, conn):
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE plates_log
+            SET payment_status = 1,
+                amount = %s
+            WHERE id = %s
+        """, (amount, record_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[POSTGRES ERROR] Update failed: {e}")
+        conn.rollback()
+        return False
 
 
+# Clean plate string
 def clean_plate(plate_raw):
     return plate_raw.replace('\x00', '').strip().upper()
 
 
+# Main loop
 def main():
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=10)
-    print(f"Listening on {SERIAL_PORT}...")
+    postgres_conn = setup_postgres()
+    if not postgres_conn:
+        print("Failed to connect to PostgreSQL.")
+        return
 
-    while True:
-        try:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=10)
+        print(f"Listening on {SERIAL_PORT}...")
 
-            if not line or line == ",-1":
-                continue
-
-            print(f"Received: {line}")
-            parts = [part.strip() for part in line.split(',')]
-            if len(parts) != 2:
-                print("Invalid format.")
-                continue
-
-            plate_raw, balance_str = parts
-            plate = clean_plate(plate_raw)
-
+        while True:
             try:
-                balance = int(balance_str)
-            except ValueError:
-                print("Invalid balance received.")
-                continue
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                print(f"Received: {line}")
 
-            entry = find_latest_unpaid(plate)
-            if not entry:
-                print(f"No unpaid entry for {plate}")
-                ser.write(b'0\n')
-                continue
+                # Skip empty or invalid Arduino signals
+                if not line or line.lower() == "ready":
+                    continue
 
-            entry_time = datetime.strptime(entry['Timestamp'], "%Y-%m-%d %H:%M:%S")
-            now = datetime.now()
-            duration = (now - entry_time).total_seconds() / 3600
-            due = int(RATE_PER_HOUR * max(1, round(duration)))
+                # Remove any 'output:' prefix
+                line = re.sub(r'^output:', '', line, flags=re.IGNORECASE)
 
-            print(f"Due for {plate}: {due} RWF")
+                # Use regex to extract plate and balance
+                match = re.search(r'([A-Z0-9]{5,10})\s*,\s*(\d+)', line)
+                if not match:
+                    print("Invalid format.")
+                    continue
 
-            # Insufficient balance handling with top-up
-            while balance < due:
-                print(f"Insufficient balance: {balance} < {due}")
-                ser.write(b'-1\n')  # Signal insufficient balance to Arduino
+                plate = clean_plate(match.group(1))
+                balance_str = match.group(2)
 
-                # Wait for Arduino's "insufficient" confirmation
-                start_time = time.time()
-                confirmation = None
-                while True:
-                    if ser.in_waiting:
-                        response = ser.readline().decode().strip()
-                        if response == "insufficient":
-                            confirmation = "insufficient"
-                            break
-                    if time.time() - start_time > 5:
-                        print("No response from Arduino.")
+                try:
+                    balance = int(balance_str)
+                except ValueError:
+                    print("Invalid balance received.")
+                    continue
+
+                record = find_latest_unpaid(plate, postgres_conn)
+                if not record:
+                    print(f"No unpaid entry for {plate}")
+                    ser.write(b'0\n')
+                    continue
+
+                record_id, entry_time = record
+                duration = (datetime.now() - entry_time).total_seconds() / 3600
+                due = int(RATE_PER_HOUR * max(1, round(duration)))
+
+                print(f"Due for {plate}: {due} RWF (Parked for {duration:.2f} hours)")
+
+                # Payment loop
+                while balance < due:
+                    print(f"Insufficient balance: {balance} < {due}")
+                    ser.write(b'-1\n')  # Notify Arduino
+
+                    # Wait for Arduino response
+                    start_time = time.time()
+                    confirmation = None
+                    while time.time() - start_time < 5:
+                        if ser.in_waiting:
+                            response = ser.readline().decode().strip()
+                            if response == "insufficient":
+                                confirmation = "insufficient"
+                                break
+
+                    if confirmation != "insufficient":
+                        break  # Exit if no confirmation
+
+                    # Handle top-up
+                    choice = input("Would you like to top-up? (yes/no): ").strip().lower()
+                    if choice != 'yes':
+                        print("Payment aborted.")
                         break
 
-                if confirmation != "insufficient":
-                    break  # Exit loop if no confirmation
-
-                # Prompt user for top-up
-                choice = input("Would you like to top-up? (yes/no): ").strip().lower()
-                if choice != 'yes':
-                    print("Payment aborted.")
-                    break
-
-                # Get valid top-up amount
-                while True:
                     try:
                         topup = int(input("Enter top-up amount (positive integer): "))
-                        if topup > 0:
-                            break
-                        print("Amount must be positive.")
+                        if topup <= 0:
+                            print("Amount must be positive.")
+                            continue
                     except ValueError:
                         print("Invalid input. Enter a number.")
+                        continue
 
-                # Send top-up command to Arduino
-                ser.write(f"topup,{topup}\n".encode())
-                print(f"Sent top-up: {topup}")
+                    # Send top-up to Arduino
+                    ser.write(f"topup,{topup}\n".encode())
+                    print(f"Sent top-up: {topup}")
 
-                # Wait for new balance confirmation
-                start_time = time.time()
-                topped = False
-                while True:
-                    if ser.in_waiting:
-                        response = ser.readline().decode().strip()
-                        if response.startswith("topped,"):
-                            try:
-                                new_balance = int(response.split(',')[1])
-                                balance = new_balance
-                                print(f"New balance: {balance} RWF")
-                                topped = True
+                    # Wait for new balance
+                    start_time = time.time()
+                    topped = False
+                    while time.time() - start_time < 5:
+                        if ser.in_waiting:
+                            response = ser.readline().decode().strip()
+                            if response.startswith("topped,"):
+                                try:
+                                    new_balance = int(response.split(',')[1])
+                                    balance = new_balance
+                                    print(f"New balance: {balance} RWF")
+                                    topped = True
+                                    break
+                                except:
+                                    print("Error processing top-up.")
+                                    break
+
+                    if not topped:
+                        continue  # Retry top-up
+
+                    # Recalculate due
+                    duration = (datetime.now() - entry_time).total_seconds() / 3600
+                    due = int(RATE_PER_HOUR * max(1, round(duration)))
+                    print(f"Updated due: {due} RWF")
+
+                # Final payment processing
+                if balance >= due:
+                    ser.write(f"{due}\n".encode())
+                    start_time = time.time()
+                    paid = False
+
+                    while time.time() - start_time < 5:
+                        if ser.in_waiting:
+                            response = ser.readline().decode().strip()
+                            if response == "done":
+                                if mark_as_paid(record_id, due, postgres_conn):
+                                    print("Payment successful and recorded!")
+                                    paid = True
                                 break
-                            except:
-                                print("Error processing top-up.")
+                            elif response == "insufficient":
+                                print("Unexpected insufficient balance after top-up.")
                                 break
-                    if time.time() - start_time > 5:
-                        print("Top-up timeout.")
-                        break
 
-                if not topped:
-                    continue  # Retry top-up
+                    if not paid:
+                        print("Payment confirmation timeout.")
 
-                # Recalculate due with updated time
-                now = datetime.now()
-                duration = (now - entry_time).total_seconds() / 3600
-                due = int(RATE_PER_HOUR * max(1, round(duration)))
-                print(f"Updated due: {due} RWF")
+            except KeyboardInterrupt:
+                print("Exiting...")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
 
-            if balance >= due:
-                # Proceed with payment
-                ser.write(f"{due}\n".encode())
-                start_time = time.time()
-                while True:
-                    if ser.in_waiting:
-                        response = ser.readline().decode().strip()
-                        if response == "done":
-                            print("Payment successful!")
-                            mark_as_paid(entry)
-                            break
-                        elif response == "insufficient":
-                            print("Unexpected insufficient balance after top-up.")
-                            break
-                    if time.time() - start_time > 5:
-                        print("Confirmation timeout.")
-                        break
-
-        except KeyboardInterrupt:
-            print("Exiting...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-
-    ser.close()
+    finally:
+        ser.close()
+        postgres_conn.close()
 
 
 if __name__ == "__main__":

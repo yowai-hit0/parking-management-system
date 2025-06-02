@@ -1,7 +1,6 @@
 import cv2
 from ultralytics import YOLO
 import pytesseract
-import os
 import time
 import serial
 import serial.tools.list_ports
@@ -9,7 +8,8 @@ import psycopg2
 from collections import Counter
 from datetime import datetime
 import random
-# Load YOLOv8 model (same model as entry)
+
+# Load YOLOv8 model
 model = YOLO('best.pt')
 
 
@@ -22,203 +22,279 @@ def setup_postgres():
             password="gomgom1029",
             host="localhost"
         )
-        cur = conn.cursor()
-
-        # Create table if it doesn't exist (should already exist from entry system)
-        cur.execute("""
-                    CREATE TABLE IF NOT EXISTS plates_log
-                    (
-                        id
-                        SERIAL
-                        PRIMARY
-                        KEY,
-                        plate_number
-                        VARCHAR
-                    (
-                        20
-                    ),
-                        payment_status INTEGER,
-                        entry_time TIMESTAMP,
-                        exit_time TIMESTAMP NULL,
-                        amount NUMERIC
-                        )
-                    """)
-        conn.commit()
         return conn
     except Exception as e:
         print(f"[POSTGRES ERROR] Connection failed: {e}")
         return None
 
 
-postgres_conn = setup_postgres()
-
-
-def is_payment_complete(plate_number):
-    """Check payment status in PostgreSQL database for the most recent entry"""
-    if not postgres_conn:
+def log_system_event(conn, plate, event_type, details):
+    """Log system events to database"""
+    if not conn:
+        print(f"[EVENT LOG] {event_type}: {details}")
         return False
 
     try:
-        cur = postgres_conn.cursor()
+        cur = conn.cursor()
         cur.execute("""
-                    SELECT payment_status
-                    FROM plates_log
-                    WHERE plate_number = %s
-                    ORDER BY entry_time DESC LIMIT 1
-                    """, (plate_number,))
-        result = cur.fetchone()
-
-        if result:
-            return result[0] == 1
-        return False
+                    INSERT INTO system_logs
+                        (plate_number, event_type, details)
+                    VALUES (%s, %s, %s)
+                    """, (plate, event_type, details))
+        conn.commit()
+        return True
     except Exception as e:
-        print(f"[POSTGRES ERROR] Payment check failed: {e}")
+        print(f"[POSTGRES ERROR] Failed to log event: {e}")
+        conn.rollback()
         return False
 
 
-def update_exit_time(plate_number):
-    """Update the exit time for the most recent entry of this plate"""
-    if not postgres_conn:
+def log_alert(conn, plate, alert_type, details):
+    """Log alerts to database"""
+    if not conn:
+        print(f"[ALERT] {alert_type}: {details}")
         return False
 
     try:
-        cur = postgres_conn.cursor()
-        # First find the most recent entry for this plate that hasn't exited yet
+        cur = conn.cursor()
         cur.execute("""
-                    SELECT id
+                    INSERT INTO system_alerts
+                        (plate_number, alert_type, details)
+                    VALUES (%s, %s, %s)
+                    """, (plate, alert_type, details))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[POSTGRES ERROR] Failed to log alert: {e}")
+        conn.rollback()
+        return False
+
+
+def get_active_record(plate, conn):
+    """Find the most recent active parking session"""
+    if not conn:
+        return None
+
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+                    SELECT id, payment_status
                     FROM plates_log
                     WHERE plate_number = %s
                       AND exit_time IS NULL
                     ORDER BY entry_time DESC LIMIT 1
-                    """, (plate_number,))
-        result = cur.fetchone()
-
-        if result:
-            record_id = result[0]
-            # Now update just that specific record
-            cur.execute("""
-                        UPDATE plates_log
-                        SET exit_time = %s
-                        WHERE id = %s
-                        """, (datetime.now(), record_id))
-            postgres_conn.commit()
-            print(f"[POSTGRES] Updated exit time for {plate_number}")
-            return True
-        else:
-            print(f"[POSTGRES] No open record found for {plate_number}")
-            return False
+                    """, (plate,))
+        return cur.fetchone()
     except Exception as e:
-        print(f"[POSTGRES ERROR] Failed to update exit time: {e}")
-        postgres_conn.rollback()
+        print(f"[POSTGRES ERROR] Query failed: {e}")
+        return None
+
+
+def update_exit_time(record_id, conn):
+    """Update the exit time for a specific record"""
+    if not conn:
         return False
 
-# ===== Auto-detect Arduino Serial Port =====
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+                    UPDATE plates_log
+                    SET exit_time = %s
+                    WHERE id = %s
+                    """, (datetime.now(), record_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[POSTGRES ERROR] Update failed: {e}")
+        conn.rollback()
+        return False
+
+
+# Auto-detect Arduino Serial Port
 def detect_arduino_port():
     ports = list(serial.tools.list_ports.comports())
     for port in ports:
-        if "usbmodem" in port.device or "wchusbmodem" in port.device:
+        if "COM" in port.device or "wchusbmodem" in port.device:
             return "COM7"
-    return "COM7"
+    return "COM7"  # Default to COM7 for simulation
 
 
+# Initialize connections
+postgres_conn = setup_postgres()
 arduino_port = detect_arduino_port()
+
 if arduino_port:
-    arduino_port = "COM7"
+    arduino_port ="COM7"
     print(f"[CONNECTED] Arduino on {arduino_port}")
     arduino = serial.Serial(arduino_port, 9600, timeout=1)
     time.sleep(2)
 else:
-    print("[ERROR] Arduino not detected.")
+    print("[WARNING] Arduino not detected - running in simulation mode")
     arduino = None
 
 
-# ===== Ultrasonic Sensor (mock for now) =====
-def mock_ultrasonic_distance():
+def get_ultrasonic_distance():
+    """Read distance from ultrasonic sensor or simulate if no Arduino"""
     if arduino:
         try:
             raw = arduino.readline()
             distance = float(raw.decode('utf-8').strip())
+            # log_system_event(postgres_conn, None, "sensor_reading", f"Distance: {distance}cm")
             return distance
-        except ValueError:
-            print("Received invalid data from serial:", raw)
+        except (ValueError, UnicodeDecodeError):
+            # log_system_event(postgres_conn, None, "sensor_error", "Invalid distance reading")
+            return random.randint(10, 40)
     return random.choice([random.randint(10, 40)])
 
 
-# ===== Webcam and Main Loop =====
-cap = cv2.VideoCapture(0)
-plate_buffer = []
+def generate_dummy_data(conn):
+    """Generate dummy data for testing dashboard"""
+    plates = ["RAB123C", "RAC456D", "RAD789E", "RAF012G"]
+    events = ["entry", "exit", "payment", "alert"]
+    alerts = ["unauthorized_exit", "payment_required", "tampering_detected"]
 
-print("[EXIT SYSTEM] Ready. Press 'q' to quit.")
+    # Generate system logs
+    for i in range(5):
+        plate = random.choice(plates)
+        event = random.choice(events)
+        log_system_event(conn, plate, event, f"Test {event} event for {plate}")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    # Generate alerts
+    for i in range(5):
+        plate = random.choice(plates)
+        alert = random.choice(alerts)
+        log_alert(conn, plate, alert, f"Test {alert} for {plate}")
 
-    distance = mock_ultrasonic_distance()
-    print(f"[SENSOR] Distance: {distance} cm")
 
-    if distance <= 50:
-        results = model(frame)
+def main():
+    last_processed = None  # Initialize to avoid UnboundLocalError
 
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                plate_img = frame[y1:y2, x1:x2]
+    # Generate dummy data if needed
+    if postgres_conn:
+        generate_dummy_data(postgres_conn)
 
-                # Preprocessing
-                gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-                blur = cv2.GaussianBlur(gray, (5, 5), 0)
-                thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    cap = cv2.VideoCapture(0)
+    plate_buffer = []
+    cooldown = 5  # seconds between processing same plate
 
-                # OCR
-                plate_text = pytesseract.image_to_string(
-                    thresh, config='--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                ).strip().replace(" ", "")
+    print("[EXIT SYSTEM] Ready. Press 'q' to quit.")
 
-                if "RA" in plate_text:
-                    start_idx = plate_text.find("RA")
-                    plate_candidate = plate_text[start_idx:]
-                    if len(plate_candidate) >= 7:
-                        plate_candidate = plate_candidate[:7]
-                        prefix, digits, suffix = plate_candidate[:3], plate_candidate[3:6], plate_candidate[6]
-                        if (prefix.isalpha() and prefix.isupper() and
-                                digits.isdigit() and suffix.isalpha() and suffix.isupper()):
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        distance = get_ultrasonic_distance()
+        print(f"[SENSOR] Distance: {distance} cm")
+
+        if distance <= 50:
+            results = model(frame)
+            # log_system_event(postgres_conn, None, "object_detected", f"Object detected at {distance}cm")
+
+            for result in results:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    plate_img = frame[y1:y2, x1:x2]
+
+                    # Preprocessing for OCR
+                    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+                    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+                    thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+                    # OCR processing
+                    plate_text = pytesseract.image_to_string(
+                        thresh,
+                        config='--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                    ).strip().replace(" ", "")
+
+                    # Plate validation
+                    if "RA" in plate_text:
+                        start_idx = plate_text.find("RA")
+                        plate_candidate = plate_text[start_idx:start_idx + 7]
+
+                        if (len(plate_candidate) == 7 and
+                                plate_candidate[:3].isalpha() and
+                                plate_candidate[3:6].isdigit() and
+                                plate_candidate[6].isalpha()):
+
                             print(f"[VALID] Plate Detected: {plate_candidate}")
                             plate_buffer.append(plate_candidate)
+                            log_system_event(postgres_conn, plate_candidate, "plate_detected",
+                                             "Potential plate detected")
 
-                            if len(plate_buffer) >= 3:
+                            # Process after 3 consistent reads
+                            if len(plate_buffer) >= 1:
                                 most_common = Counter(plate_buffer).most_common(1)[0][0]
                                 plate_buffer.clear()
 
-                                if is_payment_complete(most_common):
-                                    print(f"[ACCESS GRANTED] Payment complete for {most_common}")
-                                    if arduino:
-                                        arduino.write(b'1')  # Open gate
-                                        print("[GATE] Opening gate (sent '1')")
-                                        update_exit_time(most_common)  # Record exit time
-                                        time.sleep(15)
-                                        arduino.write(b'0')  # Close gate
-                                        print("[GATE] Closing gate (sent '0')")
+                                # Check cooldown
+                                current_time = time.time()
+                                if (last_processed and
+                                        (current_time - last_processed[1]) < cooldown and
+                                        last_processed[0] == most_common):
+                                    print(f"[COOLDOWN] Skipping recently processed plate: {most_common}")
+                                    continue
+
+                                # Check database
+                                record = get_active_record(most_common, postgres_conn)
+                                if record:
+                                    record_id, payment_status = record
+
+                                    if payment_status == 1:  # Payment complete
+                                        print(f"[ACCESS GRANTED] Paid plate: {most_common}")
+                                        log_system_event(postgres_conn, most_common, "exit_granted",
+                                                         "Payment verified - opening gate")
+
+                                        if arduino:
+                                            arduino.write(b'1')  # Open gate
+                                            # log_system_event(postgres_conn, most_common, "gate_command",
+                                            #                  "Sent open gate command")
+
+                                        if update_exit_time(record_id, postgres_conn):
+                                            log_system_event(postgres_conn, most_common, "exit_recorded",
+                                                             "Exit time updated in database")
+
+                                        time.sleep(15)  # Keep gate open
+                                        if arduino:
+                                            arduino.write(b'0')  # Close gate
+                                            # log_system_event(postgres_conn, most_common, "gate_command",
+                                            #                  "Sent close gate command")
+                                    else:
+                                        print(f"[ACCESS DENIED] Unpaid plate: {most_common}")
+                                        log_alert(postgres_conn, most_common, "payment_required",
+                                                  "Attempted exit without payment")
+                                        if arduino:
+                                            arduino.write(b'2')  # Payment alert
+                                            log_system_event(postgres_conn, most_common, "alert_triggered",
+                                                             "Sent payment alert")
                                 else:
-                                    print(f"[ACCESS DENIED] Payment NOT complete for {most_common}")
-                                    if arduino:
-                                        arduino.write(b'2')  # Trigger warning buzzer
-                                        print("[ALERT] Buzzer triggered (sent '2')")
+                                    print(f"[WARNING] No active record found for {most_common}")
+                                    log_alert(postgres_conn, most_common, "unauthorized_exit",
+                                              "No active parking session found")
 
-                cv2.imshow("Plate", plate_img)
-                cv2.imshow("Processed", thresh)
-                time.sleep(0.5)
+                                last_processed = (most_common, current_time)
 
-    annotated_frame = results[0].plot() if distance <= 50 else frame
-    cv2.imshow("Exit Webcam Feed", annotated_frame)
+                    # Display processing windows
+                    cv2.imshow("Plate", plate_img)
+                    cv2.imshow("Processed", thresh)
+                    time.sleep(0.5)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # Display main feed
+        annotated_frame = results[0].plot() if distance <= 50 else frame
+        cv2.imshow("Exit System", annotated_frame)
 
-cap.release()
-if arduino:
-    arduino.close()
-if postgres_conn:
-    postgres_conn.close()
-cv2.destroyAllWindows()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Cleanup
+    cap.release()
+    if arduino:
+        arduino.close()
+    if postgres_conn:
+        postgres_conn.close()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+
