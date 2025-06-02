@@ -113,7 +113,7 @@ def mock_ultrasonic_distance():
     raw = arduino.readline()
     try:
         distance = float(raw.decode('utf-8').strip())
-        print(f"{distance} cm")
+        # print(f"{distance} cm")
         return distance
     except ValueError:
         print("Received invalid data from serial:", raw)
@@ -135,9 +135,10 @@ while True:
         break
 
     distance = mock_ultrasonic_distance()
-    print(f"[SENSOR] Distance: {distance} cm")
+    # print(f"[SENSOR] Distance: {distance} cm")
 
     if distance <= 50:
+        # print("[SENSOR] Object detected within 50 cm, processing frame...")
         results = model(frame)
 
         for result in results:
@@ -155,8 +156,10 @@ while True:
                     thresh, config='--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
                 ).strip().replace(" ", "")
 
+                print("plate",plate_text)
                 # Plate Validation
                 if "RA" in plate_text:
+                    print("staring validation")
                     start_idx = plate_text.find("RA")
                     plate_candidate = plate_text[start_idx:]
                     if len(plate_candidate) >= 7:
