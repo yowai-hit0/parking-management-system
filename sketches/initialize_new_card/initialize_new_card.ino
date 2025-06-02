@@ -28,9 +28,9 @@ void loop() {
 
   // Data to write
   byte plateBlock[16] = {0};  // Initialize array with zeroes
-  String plate = "RAF017R";  // Plate to write to block 2
+  String plate = "RAG176S";  // Plate to write to block 2
   
-  // Copy plate string into plateBlock
+  // Copy plate string into plateBlock and pad if necessary
   plate.getBytes(plateBlock, plate.length() + 1);  
 
   int balance = 10000;
