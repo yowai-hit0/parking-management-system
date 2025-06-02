@@ -32,7 +32,7 @@ def detect_arduino_port():
 
 arduino_port = detect_arduino_port()
 if arduino_port:
-    arduino_port = "COM11"
+    arduino_port = "COM13"
     print(f"[CONNECTED] Arduino on {arduino_port}")
     arduino = serial.Serial(arduino_port, 9600, timeout=1)
     print(f"[CONNECTED] Arduino on {arduino_port}")
@@ -44,11 +44,15 @@ else:
 # ===== Ultrasonic Sensor Setup =====
 import random
 def mock_ultrasonic_distance():
-    # raw = arduino.readline()
-    # distance = raw.decode('utf-8').strip()
-    # print(f"{distance} cm")
-    # return float(distance)
-    return random.choice([random.randint(10, 40)] + [random.randint(60, 150)] * 10)
+    raw = arduino.readline()
+    try:
+        distance = float(raw.decode('utf-8').strip())
+        print(f"{distance} cm")
+        return distance
+    except ValueError:
+        print("Received invalid data from serial:", raw)
+        return 100
+    # return random.choice([random.randint(10, 40)])
 
 # Initialize webcam
 cap = cv2.VideoCapture(0)
@@ -102,7 +106,7 @@ while True:
                             plate_buffer.append(plate_candidate)
 
                             # Decision after 3 captures
-                            if len(plate_buffer) >= 3:
+                            if len(plate_buffer) >= 2:
                                 most_common = Counter(plate_buffer).most_common(1)[0][0]
                                 current_time = time.time()
 
@@ -111,7 +115,7 @@ while True:
 
                                     with open(csv_file, 'a', newline='') as f:
                                         writer = csv.writer(f)
-                                        writer.writerow([most_common, 0,time.strftime('%Y-%m-%d %H:%M:%S'), 0])
+                                        writer.writerow([most_common, 0, time.strftime('%Y-%m-%d %H:%M:%S'), 0])
                                     print(f"[SAVED] {most_common} logged to CSV.")
 
                                     if arduino:
